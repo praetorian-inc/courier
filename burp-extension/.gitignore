@@ -1,0 +1,22 @@
+# OS files
+.DS_Store
+
+# Gradle and Java build artifacts
+.gradle/
+build/
+bin/
+target/
+*.jar
+*.class
+*.war
+*.ear
+
+# Runtime output
+recordings/
+*.log
+
+# Temporary files
+*.tmp
+
+# Gradle Wrapper is required to run ./gradlew
+!gradle/wrapper/gradle-wrapper.jar

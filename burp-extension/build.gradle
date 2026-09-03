@@ -1,0 +1,252 @@
+// Copyright Praetorian Security Inc
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+plugins {
+    id 'java'
+    id 'org.cyclonedx.bom' version '3.4.1'
+}
+
+group = 'com.praetorian'
+version = '1.0.0'
+
+repositories {
+    mavenCentral()
+}
+
+configurations {
+    mockitoAgent
+}
+
+dependencyLocking {
+    lockAllConfigurations()
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 17
+}
+
+def buildTimestamp = providers.environmentVariable('SOURCE_DATE_EPOCH')
+    .map { value -> java.time.Instant.ofEpochSecond(value as long).toString() }
+    .orElse(providers.provider {
+        java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern('yyyy-MM-dd HH:mm:ss'))
+    })
+
+dependencies {
+    compileOnly 'net.portswigger.burp.extensions:montoya-api:2025.8'
+
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.22.2'
+    implementation 'org.json:json:20231013'
+    implementation 'org.commonmark:commonmark:0.24.0'
+    implementation 'org.commonmark:commonmark-ext-gfm-tables:0.24.0'
+    implementation 'com.microsoft.playwright:playwright:1.54.0'
+
+    testImplementation 'net.portswigger.burp.extensions:montoya-api:2025.8'
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    testImplementation 'org.mockito:mockito-core:5.18.0'
+    mockitoAgent('org.mockito:mockito-core:5.18.0') {
+        transitive = false
+    }
+}
+
+processResources {
+    inputs.property('buildTimestamp', buildTimestamp)
+    filesMatching('build-info.properties') {
+        expand(buildTimestamp: buildTimestamp.get())
+    }
+}
+
+test {
+    useJUnitPlatform()
+    systemProperty 'java.awt.headless', 'true'
+    jvmArgs "-javaagent:${configurations.mockitoAgent.singleFile}"
+}
+
+def osName = System.getProperty('os.name').toLowerCase(Locale.ROOT)
+def architecture = System.getProperty('os.arch').toLowerCase(Locale.ROOT)
+def platformId = osName.contains('mac')
+    ? (architecture in ['aarch64', 'arm64'] ? 'mac-arm64' : 'mac-x64')
+    : osName.contains('win')
+    ? 'windows-x64'
+    : (architecture in ['aarch64', 'arm64'] ? 'linux-arm64' : 'linux-x64')
+def bundledDriverDirectory = [
+    'mac-arm64': 'mac-arm64',
+    'mac-x64': 'mac',
+    'windows-x64': 'win32_x64',
+    'linux-arm64': 'linux-arm64',
+    'linux-x64': 'linux'
+][platformId]
+def driverDirectories = ['mac-arm64', 'mac', 'win32_x64', 'linux-arm64', 'linux']
+def thirdPartyLicenses = layout.buildDirectory.dir('generated/third-party-licenses')
+
+tasks.register('collectThirdPartyLicenses') {
+    inputs.files(configurations.runtimeClasspath)
+    outputs.dir(thirdPartyLicenses)
+    doLast {
+        delete(thirdPartyLicenses)
+        configurations.runtimeClasspath.resolvedConfiguration.resolvedArtifacts.each { artifact ->
+            def coordinate = "${artifact.moduleVersion.id.group}.${artifact.name}-${artifact.moduleVersion.id.version}"
+            copy {
+                from(zipTree(artifact.file)) {
+                    include '**/LICENSE', '**/LICENSE.*', '**/NOTICE', '**/NOTICE.*',
+                            '**/ThirdPartyNotices.txt', '**/COPYING', '**/COPYING.*'
+                    eachFile { details ->
+                        if (artifact.name == 'driver-bundle'
+                                && details.path.startsWith('driver/')
+                                && !details.path.startsWith("driver/${bundledDriverDirectory}/")) {
+                            details.exclude()
+                        } else {
+                            details.path = "${coordinate}/${details.path}"
+                        }
+                    }
+                    includeEmptyDirs = false
+                }
+                into thirdPartyLicenses
+                duplicatesStrategy = DuplicatesStrategy.INCLUDE
+            }
+        }
+    }
+}
+
+tasks.named('cyclonedxDirectBom') {
+    includeConfigs = ['runtimeClasspath']
+    skipConfigs = ['(?i).*test.*', 'mockitoAgent']
+    includeLicenseText = true
+}
+
+tasks.named('cyclonedxBom') {
+    includeLicenseText = true
+}
+
+tasks.withType(AbstractArchiveTask).configureEach {
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+}
+
+jar {
+    dependsOn tasks.named('collectThirdPartyLicenses')
+    archiveBaseName = 'CourierConnector'
+    archiveClassifier = platformId
+    from({
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }) {
+        exclude 'META-INF/LICENSE', 'META-INF/LICENSE.txt', 'META-INF/NOTICE', 'META-INF/NOTICE.txt'
+    }
+    from('../LICENSE') {
+        into 'META-INF'
+    }
+    from(thirdPartyLicenses) {
+        into 'META-INF/third-party-licenses'
+    }
+    from('../THIRD_PARTY_NOTICES.md') {
+        into 'META-INF'
+    }
+    driverDirectories.findAll { it != bundledDriverDirectory }.each {
+        exclude "driver/${it}/**"
+    }
+    manifest {
+        attributes(
+            'Implementation-Title': 'Courier Connector',
+            'Implementation-Version': version,
+            'Build-Timestamp': buildTimestamp.get(),
+            'Courier-Platform': platformId
+        )
+    }
+    exclude 'META-INF/*.RSA', 'META-INF/*.SF', 'META-INF/*.DSA'
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+tasks.register('copyJar') {
+    dependsOn jar
+    def sourceJar = tasks.named('jar').flatMap { it.archiveFile }
+    def destinationJar = layout.projectDirectory.file('CourierConnector.jar')
+    inputs.file(sourceJar)
+    outputs.file(destinationJar)
+    doLast {
+        java.nio.file.Files.copy(sourceJar.get().asFile.toPath(),
+                destinationJar.asFile.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+    }
+}
+
+tasks.register('verifyDistribution') {
+    dependsOn jar
+    doLast {
+        def archive = jar.archiveFile.get().asFile
+        if (archive.length() >= 100L * 1024 * 1024) {
+            throw new GradleException("Platform JAR is unexpectedly large: ${archive.length()} bytes")
+        }
+        def zip = new java.util.zip.ZipFile(archive)
+        try {
+            def entries = java.util.Collections.list(zip.entries())*.name
+            def driverExecutables = entries.findAll {
+                it.matches('driver/(linux|linux-arm64|mac|mac-arm64)/node')
+                    || it == 'driver/win32_x64/node.exe'
+            }
+            def expectedDriver = platformId == 'windows-x64'
+                ? 'driver/win32_x64/node.exe'
+                : "driver/${bundledDriverDirectory}/node"
+            if (driverExecutables != [expectedDriver]) {
+                throw new GradleException("Expected only ${expectedDriver}, found ${driverExecutables}")
+            }
+            if (!entries.contains('META-INF/LICENSE')) {
+                throw new GradleException('Courier license is missing from the release JAR')
+            }
+            if (!entries.contains('META-INF/THIRD_PARTY_NOTICES.md')
+                    || !entries.any { it.startsWith('META-INF/third-party-licenses/') }) {
+                throw new GradleException('Third-party notices are missing from the release JAR')
+            }
+        } finally {
+            zip.close()
+        }
+    }
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('verifyDistribution')
+}
+
+tasks.register('releaseArtifacts') {
+    dependsOn jar, tasks.named('cyclonedxBom'), tasks.named('verifyDistribution')
+    def outputDirectory = layout.buildDirectory.dir('releases')
+    outputs.dir(outputDirectory)
+    doLast {
+        def directory = outputDirectory.get().asFile.toPath()
+        delete(directory)
+        java.nio.file.Files.createDirectories(directory)
+        def releaseName = "CourierConnector-${version}-${platformId}.jar"
+        def releaseJar = directory.resolve(releaseName)
+        java.nio.file.Files.copy(jar.archiveFile.get().asFile.toPath(), releaseJar)
+        def sbom = layout.buildDirectory.file('reports/cyclonedx/bom.json').get().asFile.toPath()
+        def releaseSbom = directory.resolve("CourierConnector-${version}-${platformId}.cdx.json")
+        java.nio.file.Files.copy(sbom, releaseSbom)
+        def digest = java.security.MessageDigest.getInstance('SHA-256')
+        def checksums = [releaseJar, releaseSbom].collect { file ->
+            digest.reset()
+            def hash = digest.digest(java.nio.file.Files.readAllBytes(file)).encodeHex().toString()
+            "${hash}  ${file.fileName}"
+        }.join(System.lineSeparator()) + System.lineSeparator()
+        java.nio.file.Files.writeString(
+                directory.resolve("CourierConnector-${version}-${platformId}.sha256"), checksums)
+    }
+}
+
+build.finalizedBy(copyJar)
